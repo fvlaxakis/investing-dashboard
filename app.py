@@ -197,6 +197,123 @@ def fmt_money(x, cur=""):
 
 
 # ----------------------------------------------------------------------------
+# 📰 Νέα ανά μετοχή
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_news(ticker: str, limit: int = 6) -> list:
+    try:
+        raw = yf.Ticker(ticker).news or []
+    except Exception:
+        return []
+    out = []
+    for item in raw[:limit]:
+        # yfinance επιστρέφει είτε flat dict είτε {'content': {...}}
+        c = item.get("content", item)
+        title = c.get("title") or item.get("title")
+        if not title:
+            continue
+        link = (
+            item.get("link")
+            or (c.get("clickThroughUrl") or {}).get("url")
+            or (c.get("canonicalUrl") or {}).get("url")
+            or ""
+        )
+        publisher = (
+            item.get("publisher")
+            or (c.get("provider") or {}).get("displayName")
+            or ""
+        )
+        out.append({"title": title, "link": link, "publisher": publisher})
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 💱 Μετατροπή σε EUR (για το χαρτοφυλάκιο)
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def fx_to_eur(currency: str) -> float:
+    """Πόσα EUR κάνει 1 μονάδα του νομίσματος. EUR->1.0."""
+    cur = (currency or "EUR").upper()
+    if cur in ("EUR", ""):
+        return 1.0
+    # Yahoo: 'USDEUR=X' = EUR ανά 1 USD
+    try:
+        hist = yf.Ticker(f"{cur}EUR=X").history(period="5d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return 1.0  # fallback: αν αποτύχει, μη μετατρέπεις
+
+
+# ----------------------------------------------------------------------------
+# 🔔 Market Radar — ανιχνευτής ασυνήθιστων κινήσεων
+# ----------------------------------------------------------------------------
+def scan_alerts(ticker: str, df: pd.DataFrame) -> list:
+    """Επιστρέφει λίστα από (severity, text). severity: 'red'|'green'|'info'."""
+    if df.empty or len(df) < 60:
+        return []
+    alerts = []
+    last = df.iloc[-1]
+    close = last["Close"]
+    prev = df["Close"].iloc[-2]
+    day_ret = close / prev - 1
+
+    # 1) Ασυνήθιστος όγκος
+    if "Volume" in df and df["Volume"].iloc[-20:].mean() > 0:
+        avg_vol = df["Volume"].iloc[-21:-1].mean()
+        if avg_vol > 0 and last["Volume"] > 2 * avg_vol:
+            mult = last["Volume"] / avg_vol
+            arrow = "🟢📈" if day_ret >= 0 else "🔴📉"
+            alerts.append(
+                ("info", f"{arrow} Ασυνήθιστος όγκος {mult:.1f}× του μέσου "
+                         f"(τιμή {day_ret*100:+.1f}%) — συνήθως υπάρχει είδηση.")
+            )
+
+    # 2) Απότομη κίνηση σε σχέση με τη μεταβλητότητα (z-score)
+    daily = df["Close"].pct_change().iloc[-21:]
+    std = daily.std()
+    if std and std > 0:
+        z = day_ret / std
+        if z <= -2.5:
+            alerts.append(("red", f"🔴 Απότομη πτώση {day_ret*100:+.1f}% "
+                                  f"({abs(z):.1f}× πάνω από το κανονικό)."))
+        elif z >= 2.5:
+            alerts.append(("green", f"🟢 Απότομη άνοδος {day_ret*100:+.1f}% "
+                                    f"({z:.1f}× πάνω από το κανονικό)."))
+
+    # 3) 52-εβδομάδων high / low
+    window = df["Close"].iloc[-252:]
+    hi, lo = window.max(), window.min()
+    if close >= hi * 0.995:
+        alerts.append(("green", "🟢 Νέο υψηλό 52 εβδομάδων — δυνατή ανοδική ορμή."))
+    elif close <= lo * 1.005:
+        alerts.append(("red", "🔴 Νέο χαμηλό 52 εβδομάδων — προσοχή."))
+
+    # 4) Golden / Death cross (MA50 x MA200 τις τελευταίες ~5 μέρες)
+    if not np.isnan(last["SMA50"]) and not np.isnan(last["SMA200"]):
+        recent = df.iloc[-6:]
+        above = recent["SMA50"] > recent["SMA200"]
+        if above.iloc[0] != above.iloc[-1]:
+            if above.iloc[-1]:
+                alerts.append(("green", "🟢 Golden Cross: ο MA50 πέρασε πάνω "
+                                        "από τον MA200 (μακροπρόθεσμα θετικό)."))
+            else:
+                alerts.append(("red", "🔴 Death Cross: ο MA50 πέρασε κάτω από "
+                                      "τον MA200 (μακροπρόθεσμα αρνητικό)."))
+
+    # 5) RSI ακραίο
+    r = last["RSI"]
+    if not np.isnan(r):
+        if r >= 75:
+            alerts.append(("red", f"🔴 RSI {r:.0f} — έντονα υπεραγορασμένο."))
+        elif r <= 25:
+            alerts.append(("green", f"🟢 RSI {r:.0f} — έντονα υπερπουλημένο "
+                                    "(πιθανή ευκαιρία)."))
+    return alerts
+
+
+# ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
 st.title("📈 Επενδυτικό Dashboard")
@@ -236,18 +353,23 @@ with st.sidebar:
 
 tickers = [t.strip().upper() for t in watchlist_raw.split(",") if t.strip()]
 
-tab_overview, tab_detail = st.tabs(["🏠 Επισκόπηση & Κατανομή", "🔍 Ανάλυση μετοχής"])
+tab_overview, tab_detail, tab_portfolio = st.tabs(
+    ["🏠 Επισκόπηση & Κατανομή", "🔍 Ανάλυση μετοχής", "💼 Χαρτοφυλάκιο"]
+)
 
 # --- Επισκόπηση: πίνακας σκορ όλων + πρόταση κατανομής ------------------------
 with tab_overview:
     rows = []
     signals = {}
+    all_alerts = []  # (ticker, severity, text)
     with st.spinner("Φόρτωση δεδομένων..."):
         for t in tickers:
             df = load_history(t, period="2y")
             info = load_info(t)
             score, label, reasons = compute_signal(df)
             signals[t] = (score, label, reasons)
+            for sev, txt in scan_alerts(t, df):
+                all_alerts.append((t, sev, txt))
             price = df["Close"].iloc[-1] if not df.empty else np.nan
             chg = (df["Close"].iloc[-1] / df["Close"].iloc[-2] - 1) * 100 if len(df) > 1 else np.nan
             tier, badge, note = tax_profile(t, info)
@@ -266,6 +388,24 @@ with tab_overview:
                     "Κλάδος": info["sector"],
                 }
             )
+
+    # --- 🔔 Market Radar -----------------------------------------------------
+    st.subheader("🔔 Market Radar")
+    if all_alerts:
+        st.caption(f"{len(all_alerts)} ασυνήθιστες κινήσεις εντοπίστηκαν στη watchlist:")
+        # Ταξινόμηση: κόκκινα πρώτα, μετά πράσινα, μετά info
+        order = {"red": 0, "green": 1, "info": 2}
+        for t, sev, txt in sorted(all_alerts, key=lambda a: order.get(a[1], 3)):
+            line = f"**{t}** — {txt}"
+            if sev == "red":
+                st.error(line)
+            elif sev == "green":
+                st.success(line)
+            else:
+                st.info(line)
+    else:
+        st.caption("✅ Τίποτα ασυνήθιστο αυτή τη στιγμή στη watchlist — ήρεμα νερά.")
+    st.divider()
 
     if rows:
         table = pd.DataFrame(rows).sort_values("Σκορ", ascending=False)
@@ -398,6 +538,110 @@ with tab_detail:
                 mfig.add_trace(go.Scatter(x=df.index, y=df["MACD_signal"], name="Signal"))
                 mfig.update_layout(title="MACD", height=250, margin=dict(t=30, b=10, l=10, r=10))
                 st.plotly_chart(mfig, use_container_width=True)
+
+            # 🔔 Ειδοποιήσεις radar για τη συγκεκριμένη μετοχή
+            sel_alerts = scan_alerts(sel, load_history(sel, period="2y"))
+            if sel_alerts:
+                st.markdown("**🔔 Ασυνήθιστες κινήσεις:**")
+                for sev, txt in sel_alerts:
+                    (st.error if sev == "red" else st.success if sev == "green" else st.info)(txt)
+
+            # 📰 Νέα
+            st.markdown("**📰 Πρόσφατα νέα**")
+            news = load_news(sel)
+            if news:
+                for n in news:
+                    pub = f" — *{n['publisher']}*" if n["publisher"] else ""
+                    if n["link"]:
+                        st.markdown(f"- [{n['title']}]({n['link']}){pub}")
+                    else:
+                        st.markdown(f"- {n['title']}{pub}")
+            else:
+                st.caption("Δεν βρέθηκαν πρόσφατα νέα για αυτό το σύμβολο.")
+
+# --- 💼 Χαρτοφυλάκιο: πραγματικές αγορές, κέρδος/ζημιά, καθαρό μετά φόρου -----
+with tab_portfolio:
+    st.subheader("💼 Το χαρτοφυλάκιό μου")
+    st.caption(
+        "Βάλε τις αγορές σου: σύμβολο, ποσότητα (τεμάχια) και μέση τιμή αγοράς "
+        "(στο νόμισμα της μετοχής). Τα κενά αγνοούνται. Οι τιμές είναι live· τα "
+        "σύνολα μετατρέπονται σε € αυτόματα."
+    )
+    seed = pd.DataFrame(
+        [{"Σύμβολο": "", "Ποσότητα": None, "Τιμή αγοράς": None}]
+    )
+    edited = st.data_editor(
+        seed, num_rows="dynamic", use_container_width=True, hide_index=True,
+        column_config={
+            "Σύμβολο": st.column_config.TextColumn(help="π.χ. VUAA.DE, AAPL"),
+            "Ποσότητα": st.column_config.NumberColumn(format="%.4f", min_value=0),
+            "Τιμή αγοράς": st.column_config.NumberColumn(format="%.2f", min_value=0),
+        },
+        key="portfolio_editor",
+    )
+
+    prows, tot_val_eur, tot_cost_eur, tot_div_eur = [], 0.0, 0.0, 0.0
+    for _, r in edited.iterrows():
+        sym = str(r["Σύμβολο"]).strip().upper()
+        qty, buy = r["Ποσότητα"], r["Τιμή αγοράς"]
+        if not sym or not qty or qty <= 0:
+            continue
+        df = load_history(sym, period="6mo")
+        info = load_info(sym)
+        if df.empty:
+            prows.append({"Σύμβολο": sym, "Κατάσταση": "❌ άγνωστο σύμβολο"})
+            continue
+        cur = info["currency"] or "EUR"
+        price = float(df["Close"].iloc[-1])
+        rate = fx_to_eur(cur)
+        value_eur = price * qty * rate
+        cost_eur = (buy or 0) * qty * rate
+        pl_eur = value_eur - cost_eur
+        pl_pct = (price / buy - 1) * 100 if buy else np.nan
+        # Ετήσιο μέρισμα (φορ. 5%) — dividend_yield είναι ήδη %
+        dy = info["dividend_yield"] or 0
+        div_eur = value_eur * (dy / 100)
+        tot_val_eur += value_eur
+        tot_cost_eur += cost_eur
+        tot_div_eur += div_eur
+        tier, badge, _ = tax_profile(sym, info)
+        prows.append({
+            "Σύμβολο": sym,
+            "Ποσότητα": qty,
+            "Τιμή τώρα": f"{price:.2f} {cur}",
+            "Αξία €": round(value_eur, 2),
+            "Κέρδος/Ζημιά €": round(pl_eur, 2),
+            "Απόδοση %": round(pl_pct, 1) if not np.isnan(pl_pct) else None,
+            "Φόρος υπεραξίας": "0% ✅" if tier in ("green", "yellow") else "15%; ⚠️",
+        })
+
+    if any("Αξία €" in p for p in prows):
+        st.dataframe(
+            pd.DataFrame(prows),
+            use_container_width=True, hide_index=True,
+        )
+        pl_total = tot_val_eur - tot_cost_eur
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Συνολική αξία", f"{tot_val_eur:,.0f} €")
+        m2.metric("Κόστος", f"{tot_cost_eur:,.0f} €")
+        m3.metric(
+            "Κέρδος/Ζημιά", f"{pl_total:,.0f} €",
+            f"{(pl_total/tot_cost_eur*100):+.1f}%" if tot_cost_eur else None,
+        )
+        m4.metric("Ετήσιο μέρισμα (~)", f"{tot_div_eur:,.0f} €",
+                  f"-{tot_div_eur*0.05:,.0f} € φόρος 5%")
+        st.success(
+            f"💡 Καλά νέα: το κέρδος από την πώληση (υπεραξία) των μετοχών & UCITS "
+            f"ETF είναι **αφορολόγητο** για σένα → τα **{pl_total:,.0f} €** κέρδος "
+            "είναι καθαρά. Φόρος πληρώνεις μόνο ~5% στα μερίσματα (πάνω)."
+        )
+        st.caption(
+            "⚠️ Ενδεικτικός υπολογισμός. Οι τιμές έχουν καθυστέρηση ~15'. Το "
+            "χαρτοφυλάκιο δεν αποθηκεύεται μόνιμα — αν κλείσεις το app, ξαναβάζεις "
+            "τις γραμμές (μπορώ να προσθέσω μόνιμη αποθήκευση αργότερα)."
+        )
+    else:
+        st.info("Πρόσθεσε γραμμές παραπάνω για να δεις κέρδος/ζημιά και σύνολα.")
 
 st.markdown("---")
 st.caption(
