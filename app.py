@@ -415,25 +415,64 @@ with tab_portfolio:
     )
 
     default_seed = [{"Σύμβολο": "", "Ποσότητα": None, "Τιμή αγοράς": None}]
+    COLS = ["Σύμβολο", "Ποσότητα", "Τιμή αγοράς"]
 
-    # 💾 Μόνιμη αποθήκευση στη συσκευή (browser localStorage)
+    def _get_secret(k):
+        try:
+            return st.secrets[k]
+        except Exception:
+            return None
+
+    SUPA_URL = _get_secret("SUPABASE_URL")
+    SUPA_KEY = _get_secret("SUPABASE_KEY")
+    use_supabase = bool(SUPA_URL and SUPA_KEY)
+
+    def records_to_df(recs):
+        df = pd.DataFrame(recs)
+        if df.empty:
+            return pd.DataFrame(default_seed)
+        return df.rename(columns={"symbol": "Σύμβολο", "qty": "Ποσότητα",
+                                  "buy_price": "Τιμή αγοράς"})[COLS]
+
+    def df_to_records(df):
+        recs = []
+        for _, r in df.iterrows():
+            s = str(r["Σύμβολο"]).strip().upper()
+            if not s or pd.isna(r["Ποσότητα"]):
+                continue
+            recs.append({"symbol": s,
+                         "qty": float(r["Ποσότητα"]),
+                         "buy_price": float(r["Τιμή αγοράς"]) if pd.notna(r["Τιμή αγοράς"]) else None})
+        return recs
+
+    # localStorage (fallback όταν δεν υπάρχει Supabase)
     local_store = None
-    if LocalStorage is not None:
+    if not use_supabase and LocalStorage is not None:
         try:
             local_store = LocalStorage()
         except Exception:
             local_store = None
 
+    # --- Φόρτωση αρχικών δεδομένων (μία φορά ανά session) --------------------
     if "pf_seed" not in st.session_state:
-        seed_data = default_seed
-        if local_store is not None:
+        seed_df = pd.DataFrame(default_seed)
+        if use_supabase:
+            try:
+                seed_df = records_to_df(core.supabase_load(SUPA_URL, SUPA_KEY))
+            except Exception as e:
+                st.warning(f"Δεν φορτώθηκε από Supabase: {e}")
+        elif local_store is not None:
             try:
                 saved = local_store.getItem("portfolio_v1")
                 if saved:
-                    seed_data = json.loads(saved)
+                    seed_df = pd.DataFrame(json.loads(saved))
             except Exception:
-                seed_data = default_seed
-        st.session_state.pf_seed = pd.DataFrame(seed_data)
+                pass
+        st.session_state.pf_seed = seed_df
+
+    if use_supabase:
+        st.caption("🔄 **Sync ενεργό (Supabase)** — το χαρτοφυλάκιο είναι ίδιο σε "
+                   "κινητό & υπολογιστή.")
 
     edited = st.data_editor(
         st.session_state.pf_seed, num_rows="dynamic",
@@ -446,31 +485,36 @@ with tab_portfolio:
         key="portfolio_editor",
     )
 
-    # Κουμπιά αποθήκευσης / backup
+    # --- Κουμπιά αποθήκευσης / backup ---------------------------------------
     b1, b2 = st.columns([1, 1])
     with b1:
         if st.button("💾 Αποθήκευση", use_container_width=True):
-            payload = edited.to_json(orient="records", force_ascii=False)
-            if local_store is not None:
+            if use_supabase:
                 try:
-                    local_store.setItem("portfolio_v1", payload)
-                    st.success("✅ Αποθηκεύτηκε στη συσκευή σου. Θα το θυμάται και "
-                               "την επόμενη φορά που θα ανοίξεις το app εδώ.")
+                    core.supabase_save(SUPA_URL, SUPA_KEY, df_to_records(edited))
+                    st.success("✅ Αποθηκεύτηκε στο cloud — συγχρονισμένο παντού.")
+                except Exception as e:
+                    st.error(f"Αποτυχία Supabase: {e}")
+            elif local_store is not None:
+                try:
+                    local_store.setItem(
+                        "portfolio_v1", edited.to_json(orient="records", force_ascii=False))
+                    st.success("✅ Αποθηκεύτηκε στη συσκευή σου (μόνο εδώ — για sync "
+                               "παντού ρύθμισε Supabase).")
                 except Exception:
-                    st.warning("Δεν έγινε αποθήκευση στη συσκευή — κατέβασε CSV δεξιά.")
+                    st.warning("Δεν έγινε αποθήκευση — κατέβασε CSV.")
             else:
-                st.warning("Η αποθήκευση στη συσκευή δεν είναι διαθέσιμη — "
-                           "χρησιμοποίησε το CSV δεξιά.")
+                st.warning("Αποθήκευση μη διαθέσιμη — χρησιμοποίησε το CSV.")
     with b2:
         st.download_button(
             "⬇️ Backup CSV", edited.to_csv(index=False).encode("utf-8"),
             file_name="portfolio.csv", mime="text/csv", use_container_width=True,
         )
-    up = st.file_uploader("⬆️ Επαναφορά από CSV (π.χ. σε άλλη συσκευή)", type="csv")
+    up = st.file_uploader("⬆️ Επαναφορά από CSV", type="csv")
     if up is not None:
         try:
             st.session_state.pf_seed = pd.read_csv(up)
-            st.success("Φορτώθηκε. Πάτα «💾 Αποθήκευση» για να το κρατήσεις μόνιμα.")
+            st.success("Φορτώθηκε. Πάτα «💾 Αποθήκευση» για να το κρατήσεις.")
             st.rerun()
         except Exception:
             st.error("Δεν διαβάστηκε το CSV.")
