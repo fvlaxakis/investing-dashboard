@@ -9,11 +9,19 @@ Live τιμές & γραφήματα από Yahoo Finance (δωρεάν), τεχ
 Δείχνει στο κινητό: κάνε deploy δωρεάν στο Streamlit Community Cloud (δες README).
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
+
+import core
+
+try:
+    from streamlit_local_storage import LocalStorage
+except Exception:  # η βιβλιοθήκη μπορεί να λείπει σε κάποιο περιβάλλον
+    LocalStorage = None
 
 st.set_page_config(page_title="Επενδυτικό Dashboard", page_icon="📈", layout="wide")
 
@@ -23,167 +31,17 @@ st.set_page_config(page_title="Επενδυτικό Dashboard", page_icon="📈"
 DEFAULT_WATCHLIST = "AAPL, MSFT, NVDA, VUAA.DE, IWDA.AS, ASML.AS"
 # VUAA.DE = S&P 500 ETF (EUR, Xetra) · IWDA.AS = MSCI World ETF (Amsterdam)
 
-
 # ----------------------------------------------------------------------------
-# Δείκτες (υπολογισμένοι με pandas — χωρίς εξωτερικές βιβλιοθήκες TA)
+# Cached wrappers γύρω από την καθαρή λογική του core.py
+# (η ίδια λογική χρησιμοποιείται και από το scan_email.py για το πρωινό email)
 # ----------------------------------------------------------------------------
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def load_history(ticker: str, period: str = "2y") -> pd.DataFrame:
-    df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
-    if df.empty:
-        return df
-    df["SMA50"] = df["Close"].rolling(50).mean()
-    df["SMA200"] = df["Close"].rolling(200).mean()
-    df["RSI"] = rsi(df["Close"])
-    df["MACD"], df["MACD_signal"], df["MACD_hist"] = macd(df["Close"])
-    return df
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_info(ticker: str) -> dict:
-    try:
-        info = yf.Ticker(ticker).info
-    except Exception:
-        info = {}
-    return {
-        "name": info.get("shortName") or ticker,
-        "currency": info.get("currency", ""),
-        "pe": info.get("trailingPE"),
-        "forward_pe": info.get("forwardPE"),
-        "dividend_yield": info.get("dividendYield"),
-        "market_cap": info.get("marketCap"),
-        "sector": info.get("sector", "—"),
-        "target_mean": info.get("targetMeanPrice"),
-        "quote_type": (info.get("quoteType") or "").upper(),  # EQUITY / ETF / MUTUALFUND
-    }
-
-
-# ----------------------------------------------------------------------------
-# Φορολογικός χαρακτηρισμός για φορολογικό κάτοικο Ελλάδας (ΙΔΙΩΤΗ)
-# Βάση: Ν.4172/2013 άρθρα 42-43. ΔΕΝ είναι φορολογική συμβουλή — heuristic.
-#   • Μετοχές εισηγμένες, κατοχή <0,5% (πάντα ισχύει για ιδιώτη): υπεραξία 0%
-#   • UCITS ETF (ευρωπαϊκά, IE/LU domicile): υπεραξία 0% για ιδιώτες
-#       - accumulating (χωρίς μέρισμα) => και 0% σε μερίσματα => πλήρως αφορολόγητο
-#       - distributing => 5% στο μέρισμα
-#   • US ETF: συνήθως μη διαθέσιμα σε EU retail (PRIIPs) — τα σημειώνουμε κόκκινα
-# ----------------------------------------------------------------------------
-_EU_SUFFIXES = (".DE", ".AS", ".L", ".MI", ".PA", ".AT", ".BR", ".MC",
-                ".SW", ".VI", ".HE", ".ST", ".OL", ".CO", ".LS", ".IR", ".F")
-
-
-def tax_profile(ticker: str, info: dict):
-    """Επιστρέφει (tier, badge, note). tier: 'green' | 'yellow' | 'red'."""
-    qt = info.get("quote_type", "")
-    dy = info.get("dividend_yield") or 0
-    has_div = bool(dy and dy > 0)
-    european = ticker.upper().endswith(_EU_SUFFIXES)
-
-    if qt in ("ETF", "MUTUALFUND"):
-        if not european:
-            return ("red", "⛔ US/μη-UCITS",
-                    "Πιθανώς μη διαθέσιμο σε EU retail (PRIIPs). Ψάξε το UCITS "
-                    "αντίστοιχο σε ευρωπαϊκό χρηματιστήριο (π.χ. .DE/.AS).")
-        if has_div:
-            return ("yellow", "✅ Υπεραξία 0% · ⚠️ Μέρισμα 5%",
-                    "UCITS distributing: κέρδος πώλησης αφορολόγητο, μέρισμα 5%. "
-                    "Για μηδενικό φόρο ψάξε την 'Acc' (accumulating) έκδοση.")
-        return ("green", "✅✅ Πλήρως αφορολόγητο",
-                "Accumulating UCITS: χωρίς μέρισμα (0%) & υπεραξία αφορολόγητη.")
-
-    if qt == "EQUITY":
-        if has_div:
-            return ("yellow", "✅ Υπεραξία 0% · ⚠️ Μέρισμα 5%",
-                    "Εισηγμένη μετοχή, κατοχή <0,5%: κέρδος πώλησης αφορολόγητο· "
-                    "το μέρισμα φορολογείται 5%.")
-        return ("green", "✅✅ Πλήρως αφορολόγητο",
-                "Μετοχή χωρίς μέρισμα, κατοχή <0,5%: υπεραξία αφορολόγητη, "
-                "χωρίς μέρισμα να φορολογηθεί.")
-
-    return ("red", "⚠️ Έλεγξε (15%;)",
-            "Ομόλογο/άγνωστος τύπος: η υπεραξία μπορεί να φορολογείται 15%. "
-            "Επιβεβαίωσε με φοροτεχνικό.")
-
-
-# ----------------------------------------------------------------------------
-# Διαφανές σκορ σήματος (heuristic — ΟΧΙ εγγύηση)
-# ----------------------------------------------------------------------------
-def compute_signal(df: pd.DataFrame):
-    """Επιστρέφει (score 0-100, label, λίστα από λόγους)."""
-    if df.empty or len(df) < 200:
-        return 50, "Ανεπαρκή δεδομένα", ["Δεν υπάρχει αρκετό ιστορικό για ανάλυση."]
-
-    last = df.iloc[-1]
-    price = last["Close"]
-    reasons = []
-    score = 50  # ουδέτερο ξεκίνημα
-
-    # 1) Τάση: τιμή vs κινητοί μέσοι
-    if price > last["SMA50"] > last["SMA200"]:
-        score += 20
-        reasons.append("📈 Ανοδική τάση: τιμή > MA50 > MA200.")
-    elif price < last["SMA50"] < last["SMA200"]:
-        score -= 20
-        reasons.append("📉 Καθοδική τάση: τιμή < MA50 < MA200.")
-    else:
-        reasons.append("➖ Μικτή τάση στους κινητούς μέσους.")
-
-    # 2) RSI (υπεραγορασμένο / υπερπουλημένο)
-    r = last["RSI"]
-    if not np.isnan(r):
-        if r < 30:
-            score += 10
-            reasons.append(f"🟢 RSI {r:.0f} — υπερπουλημένο (πιθανή ευκαιρία).")
-        elif r > 70:
-            score -= 10
-            reasons.append(f"🔴 RSI {r:.0f} — υπεραγορασμένο (προσοχή).")
-        else:
-            reasons.append(f"➖ RSI {r:.0f} — ουδέτερη ζώνη.")
-
-    # 3) MACD
-    if last["MACD"] > last["MACD_signal"]:
-        score += 10
-        reasons.append("🟢 MACD πάνω από τη γραμμή σήματος (θετική ορμή).")
-    else:
-        score -= 10
-        reasons.append("🔴 MACD κάτω από τη γραμμή σήματος (αρνητική ορμή).")
-
-    # 4) Απόδοση 6 μηνών
-    if len(df) > 126:
-        ret6m = price / df["Close"].iloc[-126] - 1
-        if ret6m > 0.10:
-            score += 10
-            reasons.append(f"🟢 Απόδοση 6μήνου +{ret6m*100:.0f}%.")
-        elif ret6m < -0.10:
-            score -= 10
-            reasons.append(f"🔴 Απόδοση 6μήνου {ret6m*100:.0f}%.")
-
-    score = int(max(0, min(100, score)))
-    if score >= 65:
-        label = "Ισχυρό"
-    elif score >= 45:
-        label = "Ουδέτερο"
-    else:
-        label = "Αδύναμο"
-    return score, label, reasons
+load_history = st.cache_data(ttl=900, show_spinner=False)(core.fetch_history)
+load_info = st.cache_data(ttl=3600, show_spinner=False)(core.fetch_info)
+load_news = st.cache_data(ttl=1800, show_spinner=False)(core.fetch_news)
+fx_to_eur = st.cache_data(ttl=3600, show_spinner=False)(core.fx_to_eur)
+compute_signal = core.compute_signal
+tax_profile = core.tax_profile
+scan_alerts = core.scan_alerts
 
 
 def fmt_money(x, cur=""):
@@ -194,123 +52,6 @@ def fmt_money(x, cur=""):
     if abs(x) >= 1e6:
         return f"{x/1e6:.1f}M {cur}".strip()
     return f"{x:,.2f} {cur}".strip()
-
-
-# ----------------------------------------------------------------------------
-# 📰 Νέα ανά μετοχή
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_news(ticker: str, limit: int = 6) -> list:
-    try:
-        raw = yf.Ticker(ticker).news or []
-    except Exception:
-        return []
-    out = []
-    for item in raw[:limit]:
-        # yfinance επιστρέφει είτε flat dict είτε {'content': {...}}
-        c = item.get("content", item)
-        title = c.get("title") or item.get("title")
-        if not title:
-            continue
-        link = (
-            item.get("link")
-            or (c.get("clickThroughUrl") or {}).get("url")
-            or (c.get("canonicalUrl") or {}).get("url")
-            or ""
-        )
-        publisher = (
-            item.get("publisher")
-            or (c.get("provider") or {}).get("displayName")
-            or ""
-        )
-        out.append({"title": title, "link": link, "publisher": publisher})
-    return out
-
-
-# ----------------------------------------------------------------------------
-# 💱 Μετατροπή σε EUR (για το χαρτοφυλάκιο)
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def fx_to_eur(currency: str) -> float:
-    """Πόσα EUR κάνει 1 μονάδα του νομίσματος. EUR->1.0."""
-    cur = (currency or "EUR").upper()
-    if cur in ("EUR", ""):
-        return 1.0
-    # Yahoo: 'USDEUR=X' = EUR ανά 1 USD
-    try:
-        hist = yf.Ticker(f"{cur}EUR=X").history(period="5d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-    except Exception:
-        pass
-    return 1.0  # fallback: αν αποτύχει, μη μετατρέπεις
-
-
-# ----------------------------------------------------------------------------
-# 🔔 Market Radar — ανιχνευτής ασυνήθιστων κινήσεων
-# ----------------------------------------------------------------------------
-def scan_alerts(ticker: str, df: pd.DataFrame) -> list:
-    """Επιστρέφει λίστα από (severity, text). severity: 'red'|'green'|'info'."""
-    if df.empty or len(df) < 60:
-        return []
-    alerts = []
-    last = df.iloc[-1]
-    close = last["Close"]
-    prev = df["Close"].iloc[-2]
-    day_ret = close / prev - 1
-
-    # 1) Ασυνήθιστος όγκος
-    if "Volume" in df and df["Volume"].iloc[-20:].mean() > 0:
-        avg_vol = df["Volume"].iloc[-21:-1].mean()
-        if avg_vol > 0 and last["Volume"] > 2 * avg_vol:
-            mult = last["Volume"] / avg_vol
-            arrow = "🟢📈" if day_ret >= 0 else "🔴📉"
-            alerts.append(
-                ("info", f"{arrow} Ασυνήθιστος όγκος {mult:.1f}× του μέσου "
-                         f"(τιμή {day_ret*100:+.1f}%) — συνήθως υπάρχει είδηση.")
-            )
-
-    # 2) Απότομη κίνηση σε σχέση με τη μεταβλητότητα (z-score)
-    daily = df["Close"].pct_change().iloc[-21:]
-    std = daily.std()
-    if std and std > 0:
-        z = day_ret / std
-        if z <= -2.5:
-            alerts.append(("red", f"🔴 Απότομη πτώση {day_ret*100:+.1f}% "
-                                  f"({abs(z):.1f}× πάνω από το κανονικό)."))
-        elif z >= 2.5:
-            alerts.append(("green", f"🟢 Απότομη άνοδος {day_ret*100:+.1f}% "
-                                    f"({z:.1f}× πάνω από το κανονικό)."))
-
-    # 3) 52-εβδομάδων high / low
-    window = df["Close"].iloc[-252:]
-    hi, lo = window.max(), window.min()
-    if close >= hi * 0.995:
-        alerts.append(("green", "🟢 Νέο υψηλό 52 εβδομάδων — δυνατή ανοδική ορμή."))
-    elif close <= lo * 1.005:
-        alerts.append(("red", "🔴 Νέο χαμηλό 52 εβδομάδων — προσοχή."))
-
-    # 4) Golden / Death cross (MA50 x MA200 τις τελευταίες ~5 μέρες)
-    if not np.isnan(last["SMA50"]) and not np.isnan(last["SMA200"]):
-        recent = df.iloc[-6:]
-        above = recent["SMA50"] > recent["SMA200"]
-        if above.iloc[0] != above.iloc[-1]:
-            if above.iloc[-1]:
-                alerts.append(("green", "🟢 Golden Cross: ο MA50 πέρασε πάνω "
-                                        "από τον MA200 (μακροπρόθεσμα θετικό)."))
-            else:
-                alerts.append(("red", "🔴 Death Cross: ο MA50 πέρασε κάτω από "
-                                      "τον MA200 (μακροπρόθεσμα αρνητικό)."))
-
-    # 5) RSI ακραίο
-    r = last["RSI"]
-    if not np.isnan(r):
-        if r >= 75:
-            alerts.append(("red", f"🔴 RSI {r:.0f} — έντονα υπεραγορασμένο."))
-        elif r <= 25:
-            alerts.append(("green", f"🟢 RSI {r:.0f} — έντονα υπερπουλημένο "
-                                    "(πιθανή ευκαιρία)."))
-    return alerts
 
 
 # ----------------------------------------------------------------------------
@@ -381,8 +122,9 @@ with st.sidebar:
 
 tickers = [t.strip().upper() for t in watchlist_raw.split(",") if t.strip()]
 
-tab_overview, tab_detail, tab_portfolio = st.tabs(
-    ["🏠 Επισκόπηση & Κατανομή", "🔍 Ανάλυση μετοχής", "💼 Χαρτοφυλάκιο"]
+tab_overview, tab_detail, tab_ideas, tab_portfolio = st.tabs(
+    ["🏠 Επισκόπηση & Κατανομή", "🔍 Ανάλυση μετοχής", "💡 Ιδέες (Screener)",
+     "💼 Χαρτοφυλάκιο"]
 )
 
 # --- Επισκόπηση: πίνακας σκορ όλων + πρόταση κατανομής ------------------------
@@ -418,6 +160,36 @@ with tab_overview:
             )
 
     # --- 🔔 Market Radar -----------------------------------------------------
+    # --- 📋 Τι να κάνω σήμερα -----------------------------------------------
+    st.subheader("📋 Τι να κάνω σήμερα")
+    reds = sorted({t for t, sev, _ in all_alerts if sev == "red"})
+    greens = sorted({t for t, sev, _ in all_alerts if sev == "green"})
+    if reds:
+        st.error(
+            f"🔴 **Πρόσεξε: {', '.join(reds)}.** Κάτι ασυνήθιστο (αρνητικό) "
+            "συμβαίνει. Πήγαινε στο tab «Ανάλυση μετοχής», διάβασε τα 📰 Νέα και "
+            "**μη βιάζεσαι** — μια απότομη πτώση δεν σημαίνει αυτόματα «πούλα». "
+            "Αν είναι θέση που κρατάς μακροπρόθεσμα (π.χ. ETF), συνήθως δεν κάνεις "
+            "τίποτα."
+        )
+    if greens:
+        st.success(
+            f"🟢 **Δυνατή κίνηση: {', '.join(greens)}.** Θετικό σήμα — αλλά "
+            "μην κυνηγήσεις την τιμή. Αν σε ενδιαφέρει, δες την ήρεμα στο tab "
+            "«Ανάλυση μετοχής»."
+        )
+    if not reds and not greens:
+        st.success(
+            "🟢 **Ήρεμα νερά — δεν χρειάζεται καμία ενέργεια σήμερα.** Αυτό είναι "
+            "το φυσιολογικό τις περισσότερες μέρες. Το να ΜΗΝ κάνεις κίνηση είναι "
+            "σωστή κίνηση. Μένεις στο πλάνο σου."
+        )
+    st.caption(
+        "💡 Ρυθμός: κοίτα το Radar ~1×/βδομάδα, το χαρτοφυλάκιο ~1×/μήνα. Η υπομονή "
+        "είναι το μεγαλύτερο πλεονέκτημά σου — όχι οι συχνές κινήσεις."
+    )
+    st.divider()
+
     st.subheader("🔔 Market Radar")
     if all_alerts:
         st.caption(f"{len(all_alerts)} ασυνήθιστες κινήσεις εντοπίστηκαν στη watchlist:")
@@ -587,6 +359,52 @@ with tab_detail:
             else:
                 st.caption("Δεν βρέθηκαν πρόσφατα νέα για αυτό το σύμβολο.")
 
+# --- 💡 Ιδέες (Screener): προτάσεις νέων φορολογικά αποδοτικών προϊόντων ------
+with tab_ideas:
+    st.subheader("💡 Ιδέες για νέες θέσεις")
+    st.caption(
+        "Σαρώνει ένα σύνολο δημοφιλών φορολογικά αποδοτικών προϊόντων (accumulating "
+        "UCITS ETF & μετοχές χαμηλού μερίσματος, συνήθως στο DeGiro) και προτείνει "
+        "όσα ΔΕΝ έχεις ήδη στη watchlist, με το καλύτερο σκορ. Είναι σημείο "
+        "εκκίνησης για έρευνα — **όχι εντολή αγοράς**. Πάντα επιβεβαίωσε στο DeGiro."
+    )
+    only_taxfree = st.checkbox("Μόνο πλήρως αφορολόγητα (🟢)", value=True)
+    if st.button("🔍 Σάρωση αγοράς"):
+        cands = [c for c in core.SCREENER_UNIVERSE if c not in tickers]
+        res = []
+        prog = st.progress(0.0, text="Σάρωση...")
+        for i, c in enumerate(cands):
+            prog.progress((i + 1) / len(cands), text=f"Σάρωση {c}...")
+            dfc = load_history(c, period="2y")
+            if dfc.empty:
+                continue
+            sc, lbl, _ = compute_signal(dfc)
+            infoc = load_info(c)
+            tier, badge, _ = tax_profile(c, infoc)
+            if only_taxfree and tier != "green":
+                continue
+            if not only_taxfree and tier == "red":
+                continue
+            res.append({"Σύμβολο": c, "Όνομα": infoc["name"], "Σκορ": sc,
+                        "Σήμα": lbl, "Φόρος": badge})
+        prog.empty()
+        if res:
+            resdf = pd.DataFrame(res).sort_values("Σκορ", ascending=False).head(12)
+            st.dataframe(
+                resdf.style.background_gradient(subset=["Σκορ"], cmap="RdYlGn",
+                                                vmin=0, vmax=100),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "Ταξινομημένα με σκορ. 🟢 = πλήρως αφορολόγητο. Πρόσθεσε όποιο σε "
+                "ενδιαφέρει στη watchlist για να το παρακολουθείς, και επιβεβαίωσε "
+                "διαθεσιμότητα & ISIN στο DeGiro πριν αγοράσεις."
+            )
+        else:
+            st.warning("Δεν βρέθηκαν ιδέες με αυτά τα κριτήρια αυτή τη στιγμή.")
+    else:
+        st.info("Πάτα «🔍 Σάρωση αγοράς» για προτάσεις (παίρνει ~30 δευτερόλεπτα).")
+
 # --- 💼 Χαρτοφυλάκιο: πραγματικές αγορές, κέρδος/ζημιά, καθαρό μετά φόρου -----
 with tab_portfolio:
     st.subheader("💼 Το χαρτοφυλάκιό μου")
@@ -595,11 +413,31 @@ with tab_portfolio:
         "(στο νόμισμα της μετοχής). Τα κενά αγνοούνται. Οι τιμές είναι live· τα "
         "σύνολα μετατρέπονται σε € αυτόματα."
     )
-    seed = pd.DataFrame(
-        [{"Σύμβολο": "", "Ποσότητα": None, "Τιμή αγοράς": None}]
-    )
+
+    default_seed = [{"Σύμβολο": "", "Ποσότητα": None, "Τιμή αγοράς": None}]
+
+    # 💾 Μόνιμη αποθήκευση στη συσκευή (browser localStorage)
+    local_store = None
+    if LocalStorage is not None:
+        try:
+            local_store = LocalStorage()
+        except Exception:
+            local_store = None
+
+    if "pf_seed" not in st.session_state:
+        seed_data = default_seed
+        if local_store is not None:
+            try:
+                saved = local_store.getItem("portfolio_v1")
+                if saved:
+                    seed_data = json.loads(saved)
+            except Exception:
+                seed_data = default_seed
+        st.session_state.pf_seed = pd.DataFrame(seed_data)
+
     edited = st.data_editor(
-        seed, num_rows="dynamic", use_container_width=True, hide_index=True,
+        st.session_state.pf_seed, num_rows="dynamic",
+        use_container_width=True, hide_index=True,
         column_config={
             "Σύμβολο": st.column_config.TextColumn(help="π.χ. VUAA.DE, AAPL"),
             "Ποσότητα": st.column_config.NumberColumn(format="%.4f", min_value=0),
@@ -607,6 +445,35 @@ with tab_portfolio:
         },
         key="portfolio_editor",
     )
+
+    # Κουμπιά αποθήκευσης / backup
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        if st.button("💾 Αποθήκευση", use_container_width=True):
+            payload = edited.to_json(orient="records", force_ascii=False)
+            if local_store is not None:
+                try:
+                    local_store.setItem("portfolio_v1", payload)
+                    st.success("✅ Αποθηκεύτηκε στη συσκευή σου. Θα το θυμάται και "
+                               "την επόμενη φορά που θα ανοίξεις το app εδώ.")
+                except Exception:
+                    st.warning("Δεν έγινε αποθήκευση στη συσκευή — κατέβασε CSV δεξιά.")
+            else:
+                st.warning("Η αποθήκευση στη συσκευή δεν είναι διαθέσιμη — "
+                           "χρησιμοποίησε το CSV δεξιά.")
+    with b2:
+        st.download_button(
+            "⬇️ Backup CSV", edited.to_csv(index=False).encode("utf-8"),
+            file_name="portfolio.csv", mime="text/csv", use_container_width=True,
+        )
+    up = st.file_uploader("⬆️ Επαναφορά από CSV (π.χ. σε άλλη συσκευή)", type="csv")
+    if up is not None:
+        try:
+            st.session_state.pf_seed = pd.read_csv(up)
+            st.success("Φορτώθηκε. Πάτα «💾 Αποθήκευση» για να το κρατήσεις μόνιμα.")
+            st.rerun()
+        except Exception:
+            st.error("Δεν διαβάστηκε το CSV.")
 
     prows, tot_val_eur, tot_cost_eur, tot_div_eur = [], 0.0, 0.0, 0.0
     for _, r in edited.iterrows():
@@ -664,9 +531,9 @@ with tab_portfolio:
             "είναι καθαρά. Φόρος πληρώνεις μόνο ~5% στα μερίσματα (πάνω)."
         )
         st.caption(
-            "⚠️ Ενδεικτικός υπολογισμός. Οι τιμές έχουν καθυστέρηση ~15'. Το "
-            "χαρτοφυλάκιο δεν αποθηκεύεται μόνιμα — αν κλείσεις το app, ξαναβάζεις "
-            "τις γραμμές (μπορώ να προσθέσω μόνιμη αποθήκευση αργότερα)."
+            "⚠️ Ενδεικτικός υπολογισμός. Οι τιμές έχουν καθυστέρηση ~15'. Πάτα "
+            "«💾 Αποθήκευση» για να θυμάται το χαρτοφυλάκιο στη συσκευή σου. Για "
+            "συγχρονισμό μεταξύ κινητού & υπολογιστή, χρησιμοποίησε το Backup CSV."
         )
     else:
         st.info("Πρόσθεσε γραμμές παραπάνω για να δεις κέρδος/ζημιά και σύνολα.")

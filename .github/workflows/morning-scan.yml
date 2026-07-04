@@ -1,0 +1,28 @@
+name: Πρωινή σάρωση αγοράς
+
+on:
+  schedule:
+    # 05:00 UTC = ~07:00-08:00 ώρα Ελλάδας, καθημερινές (Δευτ-Παρ)
+    # (η ώρα μετατοπίζεται κατά 1 ώρα λόγω θερινής/χειμερινής)
+    - cron: "0 5 * * 1-5"
+  workflow_dispatch:  # επιτρέπει και χειροκίνητη εκτέλεση από το GitHub
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Εγκατάσταση εξαρτήσεων
+        run: pip install yfinance pandas numpy
+
+      - name: Σάρωση & αποστολή email
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python scan_email.py
