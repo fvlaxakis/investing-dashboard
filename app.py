@@ -262,7 +262,7 @@ with tab_overview:
                     "Φόρος": badge,
                     "_tier": tier,
                     "P/E": info["pe"],
-                    "Μέρισμα %": (info["dividend_yield"] or 0) * 100 if info["dividend_yield"] else None,
+                    "Μέρισμα %": info["dividend_yield"] if info["dividend_yield"] else None,
                     "Κλάδος": info["sector"],
                 }
             )
@@ -353,7 +353,7 @@ with tab_detail:
             k3.metric("P/E", f"{info['pe']:.1f}" if info["pe"] else "—")
             k4.metric(
                 "Μέρισμα",
-                f"{info['dividend_yield']*100:.2f}%" if info["dividend_yield"] else "—",
+                f"{info['dividend_yield']:.2f}%" if info["dividend_yield"] else "—",
             )
 
             tier, badge, note = tax_profile(sel, info)
